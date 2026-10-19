@@ -1,0 +1,27 @@
+name: Mirror the existing signed ShortFlow stable release
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+permissions:
+  contents: write
+concurrency:
+  group: signed-stable-public-mirror
+  cancel-in-progress: false
+jobs:
+  mirror:
+    if: >-
+      github.repository == 'sem199318-sudo/ShortFlow-Downloads' &&
+      github.event.repository.private == false && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify using the existing public Ed25519 key
+        run: python3 -m pip install --disable-pip-version-check 'cryptography==46.0.5'
+      - name: Mirror only the signed currently published installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 mirror.py --workdir "$RUNNER_TEMP/shortflow-public-mirror"
