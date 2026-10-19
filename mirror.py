@@ -1,4 +1,7 @@
-"""Distribute only bytes authorized by ShortFlow's existing signed stable feed.
+"""Mirror current stable; explicit local owner prepublication of a signed candidate.
+
+Default cron uses only the live stable feed. Local prepublication requires a fresh
+owner-accepted stable-channel envelope and publishes a not-latest prerelease.
 
 This file may be public. It contains public verification material, no application
 source, private receipt, credential, signing key or production write access.
@@ -11,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import time
 import urllib.error
@@ -158,8 +162,8 @@ def read_asset(version,name,limit):
 
 
 def verify_file(path, manifest):
-    path = Path(path)
-    if path.is_symlink() or path.stat().st_size!=manifest['size']:
+    path = regular_file(path, 1500*1024*1024)
+    if path.stat().st_size!=manifest['size']:
         raise ValueError('Installer size mismatch')
     with path.open('rb') as source:
         if source.read(2)!=b'MZ':
@@ -180,7 +184,8 @@ def write_verification_assets(directory,manifest,raw):
         (Path(directory)/name).write_bytes(body)
 
 
-def match_release(release, manifest, raw, *, require_immutable=True, keys=KEYS):
+def match_release(release, manifest, raw, *, require_immutable=True, keys=KEYS,
+                  allow_prerelease=False):
     # The fresh feed is the current authority. Immutable metadata is historical
     # evidence for the same bytes, and may outlive its original freshness window.
     envelope = json.loads(raw,object_pairs_hook=unique)
@@ -191,7 +196,8 @@ def match_release(release, manifest, raw, *, require_immutable=True, keys=KEYS):
         raise ValueError('Archived release identifies different bytes or compatibility')
     name = alias(manifest['version'])
     if (type(release) is not dict or release.get('tag_name')!='v'+manifest['version'] or
-            release.get('prerelease') is not False):
+            type(release.get('prerelease')) is not bool or
+            (release['prerelease'] and allow_prerelease is not True)):
         raise ValueError('Release is not a public stable mirror')
     if require_immutable:
         if release.get('draft') is not False or release.get('immutable') is not True:
@@ -241,6 +247,197 @@ def release_by_tag(tag):
     return found[0] if found else None
 
 
+def safe_path(path):
+    path = Path(path).absolute()
+    for part in (path, *path.parents):
+        if part.is_symlink() or (part.exists() and getattr(part.lstat(), 'st_file_attributes', 0)&0x400):
+            raise ValueError('Redirected local distribution path')
+    return path
+
+
+def regular_file(path, maximum):
+    path = safe_path(path)
+    value = path.stat()
+    if not stat.S_ISREG(value.st_mode) or not 1 <= value.st_size <= maximum:
+        raise ValueError('Bounded regular input file required')
+    return path
+
+
+def unchanged_feed(raw):
+    if read_bytes(FEED, 65536) != raw:
+        raise ValueError('Stable feed changed; inspect retained draft/release before retry')
+    verify_manifest(raw)  # Recheck expiry after network/copy/upload work.
+
+
+def release_id(release):
+    number = release.get('id')
+    if type(number) is not int or number <= 0:
+        raise ValueError('Exact GitHub release ID required')
+    return number
+
+
+def publish_draft(release, manifest, raw, paths, notes, guard, *, prerelease=False):
+    """Complete an exact draft; never replace existing assets or tags."""
+    tag = 'v'+manifest['version']
+    guard()
+    if release is None:
+        args = ['release','create',tag,'--repo',REPOSITORY,'--draft','--target','main',
+                '--title','ShortFlow '+manifest['version'],'--notes-file',str(notes)]
+        if prerelease:
+            args += ['--prerelease']  # A draft cannot be latest; publish PATCH explicitly keeps it false.
+        gh(*args)
+        release = release_by_tag(tag)
+    if release is None:
+        raise ValueError('Created draft identity could not be verified')
+    endpoint = 'repos/'+REPOSITORY+'/releases/'+str(release_id(release))
+    if (release.get('tag_name') != tag or release.get('draft') is not True
+            or release.get('prerelease') is not prerelease):
+        raise ValueError('Unexpected interrupted release state')
+    existing = release.get('assets', [])
+    if len({a['name'] for a in existing}) != len(existing) or any(a['name'] not in paths for a in existing):
+        raise ValueError('Unexpected draft asset')
+    for asset in existing:
+        asset_id = asset.get('id')
+        if (type(asset_id) is not int or asset_id <= 0 or asset.get('url') !=
+                'https://api.github.com/repos/'+REPOSITORY+'/releases/assets/'+str(asset_id)):
+            raise ValueError('Existing draft asset belongs to an unexpected repository')
+        path = regular_file(paths[asset['name']], 1500*1024*1024)
+        with path.open('rb') as source:
+            wanted = hashlib.file_digest(source, 'sha256').hexdigest()
+        if (asset.get('size') != path.stat().st_size or asset.get('digest') != 'sha256:'+wanted
+                or asset.get('state') != 'uploaded'):
+            raise ValueError('Draft asset changed; refusing overwrite')
+    present = {a['name'] for a in existing}
+    for name, path in paths.items():
+        if name not in present:
+            guard()
+            regular_file(path, 1500*1024*1024)
+            gh('release','upload',tag,str(path),'--repo',REPOSITORY)
+    candidate = gh('api', endpoint)
+    match_release(candidate, manifest, raw, require_immutable=False, allow_prerelease=prerelease)
+    guard()
+    published = gh('api', endpoint, '--method','PATCH','-F','draft=false',
+                   '-F','prerelease='+str(prerelease).lower(),
+                   '-f','make_latest='+('false' if prerelease else 'true'))
+    match_release(published, manifest, raw, allow_prerelease=prerelease)
+    if release_id(published) != release_id(candidate) or published['prerelease'] is not prerelease:
+        raise ValueError('Published release identity/state mismatch')
+    return published
+
+
+def promote_current(release, manifest, archived, live_raw):
+    """Only current fresh stable authority may change prerelease/latest metadata.
+
+    Immutable assets and tag are never edited. GitHub explicitly permits these
+    two release flags on an immutable release. Catalog's default remains strict.
+    """
+    was_prerelease = release.get('prerelease') is True
+    match_release(release, manifest, archived, allow_prerelease=was_prerelease)
+    number = release_id(release)
+    unchanged_feed(live_raw)
+    latest = gh('api', 'repos/'+REPOSITORY+'/releases/latest', missing=True)
+    if not was_prerelease and latest is not None and latest.get('id') == number:
+        return dict(version=manifest['version'], sha256=manifest['sha256'], already_mirrored=True)
+    unchanged_feed(live_raw)
+    promoted = gh('api', 'repos/'+REPOSITORY+'/releases/'+str(number), '--method','PATCH',
+                  '-F','prerelease=false','-f','make_latest=true')
+    match_release(promoted, manifest, archived)
+    if release_id(promoted) != number:
+        raise ValueError('Promotion identity mismatch')
+    latest = gh('api','repos/'+REPOSITORY+'/releases/latest')
+    if latest.get('id') != number:
+        raise ValueError('Latest release did not match current stable; inspect, never overwrite assets')
+    unchanged_feed(live_raw)
+    return dict(version=manifest['version'], sha256=manifest['sha256'], already_mirrored=True,
+                promoted=was_prerelease, latest_updated=True)
+
+
+def write_owned(path, raw):
+    path = safe_path(path)
+    if path.exists():
+        if regular_file(path, 65536).read_bytes() != raw:
+            raise ValueError('Unrelated or changed local verification file')
+    else:
+        with path.open('xb') as output:
+            output.write(raw)
+
+
+def prepublish(directory, accepted_manifest, accepted_installer, *, keep_latest=False):
+    """Explicit local owner prepublication, not a new stable feed authority.
+
+    Fresh signed STABLE candidate + accepted bytes may be published as an immutable
+    GitHub PRERELEASE. No workflow/cron use; no latest switch; no VPS download.
+    """
+    if keep_latest is not True or os.environ.get('GITHUB_ACTIONS') or os.environ.get('CI', '').lower() == 'true':
+        raise ValueError('Explicit local --keep-latest mode only; never CI')
+    raw = regular_file(accepted_manifest, 65536).read_bytes()
+    candidate = verify_manifest(raw)
+    installer = regular_file(accepted_installer, 1500*1024*1024)
+    verify_file(installer, candidate)
+    baseline_raw = read_bytes(FEED, 65536)
+    baseline = verify_manifest(baseline_raw)
+    if versions(candidate['version']) <= versions(baseline['version']):
+        raise ValueError('Prepublication candidate must be newer than current fresh stable')
+    if gh('api', 'user').get('login') != 'sem199318-sudo':
+        raise ValueError('Existing local owner GitHub CLI login required')
+    repository = gh('api', 'repos/'+REPOSITORY)
+    if repository.get('private') is not False or repository.get('full_name') != REPOSITORY:
+        raise ValueError('Fixed public distribution repository required')
+    latest_before = gh('api', 'repos/'+REPOSITORY+'/releases/latest', missing=True)
+
+    def guard():
+        verify_manifest(raw)
+        unchanged_feed(baseline_raw)
+        verify_file(installer, candidate)
+
+    release = release_by_tag('v'+candidate['version'])
+    if release is not None and release.get('draft') is False:
+        archived = read_asset(candidate['version'], 'signed-manifest.json', 65536)
+        match_release(release, candidate, archived, allow_prerelease=True)
+        if release.get('prerelease') is not True:
+            raise ValueError('Already-published full release is not a prepublication candidate')
+        guard()
+        latest_after = gh('api', 'repos/'+REPOSITORY+'/releases/latest', missing=True)
+        if (latest_after or {}).get('id') != (latest_before or {}).get('id'):
+            raise ValueError('Latest changed concurrently; inspect, no automatic rollback')
+        return dict(version=candidate['version'], sha256=candidate['sha256'], already_mirrored=True,
+                    prepublished=True, prerelease=True, latest_unchanged=True)
+    work = safe_path(directory)
+    allowed = {alias(candidate['version']), alias(candidate['version'])+'.sha256', 'signed-manifest.json', 'notes.txt'}
+    if work.exists():
+        if not work.is_dir() or any(p.name not in allowed for p in work.iterdir()):
+            raise ValueError('Prepublication work directory must contain only its exact owned files')
+    else:
+        work.mkdir(parents=True)
+    package = safe_path(work / alias(candidate['version']))
+    if package.exists():
+        verify_file(package, candidate)
+    else:
+        count = 0
+        with installer.open('rb') as source, package.open('xb') as output:
+            while chunk := source.read(256*1024):
+                count += len(chunk)
+                if count > candidate['size']:
+                    raise ValueError('Accepted installer changed while copying')
+                output.write(chunk)
+            output.flush(); os.fsync(output.fileno())
+        verify_file(package, candidate)
+    for name, body in asset_contents(candidate, raw).items():
+        write_owned(work / name, body)
+    notes = work / 'notes.txt'
+    write_owned(notes, ('ShortFlow '+candidate['version']+' for Windows x64.\n\n'+
+        candidate['notes']+'\n\nInstaller bytes are verified against the owner-accepted '
+        'Ed25519-signed manifest. This is not an Authenticode publisher signature.\n').encode('utf-8'))
+    paths = {p.name:p for p in (package, work/(alias(candidate['version'])+'.sha256'), work/'signed-manifest.json')}
+    published = publish_draft(release, candidate, raw, paths, notes, guard, prerelease=True)
+    latest_after = gh('api', 'repos/'+REPOSITORY+'/releases/latest', missing=True)
+    if (latest_after or {}).get('id') != (latest_before or {}).get('id'):
+        raise ValueError('Latest changed concurrently; inspect, no automatic rollback')
+    guard()
+    return dict(version=candidate['version'], sha256=candidate['sha256'], size=candidate['size'],
+                release_id=release_id(published), prepublished=True, prerelease=True, latest_unchanged=True)
+
+
 def mirror(directory):
     context = os.environ.get('GITHUB_REPOSITORY',REPOSITORY)
     if context!=REPOSITORY:
@@ -255,8 +452,7 @@ def mirror(directory):
     release = release_by_tag(tag)
     if release is not None and release.get('draft') is False:
         archived = read_asset(version,'signed-manifest.json',65536)
-        match_release(release,manifest,archived)
-        return dict(version=version,sha256=manifest['sha256'],already_mirrored=True)
+        return promote_current(release, manifest, archived, raw)
     work = Path(directory).absolute()
     work.mkdir(parents=True,exist_ok=True)
     name = alias(version)
@@ -287,41 +483,22 @@ def mirror(directory):
     notes.write_text('ShortFlow '+version+' for Windows x64.\n\n'+manifest['notes']+
         '\n\nInstaller bytes are verified against the existing Ed25519-signed stable feed.\n'+
         'This is not an Authenticode publisher signature.\n',encoding='utf-8')
-    if release is None:
-        gh('release','create',tag,'--repo',REPOSITORY,'--draft','--target','main',
-           '--title','ShortFlow '+version,'--notes-file',str(notes))
-        release = release_by_tag(tag)
-    if release is None or type(release.get('id')) is not int:
-        raise ValueError('Created draft identity could not be verified')
-    endpoint = 'repos/'+REPOSITORY+'/releases/'+str(release['id'])
-    if release.get('draft') is not True or release.get('prerelease') is not False:
-        raise ValueError('Unexpected interrupted release state')
     expected = {p.name:p for p in (installer,checksum,metadata)}
-    existing = release.get('assets',[])
-    if len({a['name'] for a in existing})!=len(existing) or any(a['name'] not in expected for a in existing):
-        raise ValueError('Unexpected draft asset')
-    for asset in existing:
-        path = expected[asset['name']]
-        with path.open('rb') as source: wanted = hashlib.file_digest(source,'sha256').hexdigest()
-        if asset.get('size')!=path.stat().st_size or asset.get('digest')!='sha256:'+wanted or asset.get('state')!='uploaded':
-            raise ValueError('Draft asset changed; refusing overwrite')
-    names = {a['name'] for a in existing}
-    for name,path in expected.items():
-        if name not in names:
-            gh('release','upload',tag,str(path),'--repo',REPOSITORY)
-    candidate = gh('api',endpoint)
-    match_release(candidate,manifest,raw,require_immutable=False)
-    # The authority must still name these exact bytes after network transfer.
-    if read_bytes(FEED,65536)!=raw:
-        raise ValueError('Stable feed changed while mirroring; draft retained')
-    verify_manifest(raw)
-    gh('release','edit',tag,'--repo',REPOSITORY,'--draft=false','--latest')
-    match_release(gh('api',endpoint),manifest,raw)
+    publish_draft(release, manifest, raw, expected, notes, lambda: unchanged_feed(raw))
     return dict(version=version,sha256=manifest['sha256'],size=manifest['size'],mirrored=True)
 
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--workdir',required=True)
+    parser.add_argument('--accepted-manifest',type=Path)
+    parser.add_argument('--accepted-installer',type=Path)
+    parser.add_argument('--keep-latest',action='store_true')
     args = parser.parse_args()
-    print(json.dumps(mirror(args.workdir),sort_keys=True))
+    if args.accepted_manifest or args.accepted_installer or args.keep_latest:
+        if not (args.accepted_manifest and args.accepted_installer and args.keep_latest):
+            parser.error('Local prepublication requires both accepted inputs and --keep-latest')
+        result = prepublish(args.workdir, args.accepted_manifest, args.accepted_installer, keep_latest=True)
+    else:
+        result = mirror(args.workdir)
+    print(json.dumps(result,sort_keys=True))
