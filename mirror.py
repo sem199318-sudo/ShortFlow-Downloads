@@ -217,6 +217,16 @@ def gh(*args, missing=False):
     return result.stdout.strip() or None
 
 
+def release_by_tag(tag):
+    result = gh('api','repos/'+REPOSITORY+'/releases/tags/'+tag,missing=True)
+    if result is not None: return result
+    # GitHub may not create the Git tag until the draft is published.
+    candidates = gh('api','repos/'+REPOSITORY+'/releases?per_page=100')
+    found = [r for r in candidates if r.get('tag_name')==tag]
+    if len(found)>1: raise ValueError('Ambiguous release')
+    return found[0] if found else None
+
+
 def mirror(directory):
     context = os.environ.get('GITHUB_REPOSITORY',REPOSITORY)
     if context!=REPOSITORY:
@@ -228,19 +238,11 @@ def mirror(directory):
     manifest = verify_manifest(raw)
     version = manifest['version']
     tag = 'v'+version
-    endpoint = 'repos/'+REPOSITORY+'/releases/tags/'+tag
-    release = gh('api',endpoint,missing=True)
+    release = release_by_tag(tag)
     if release is not None and release.get('draft') is False:
         archived = read_asset(version,'signed-manifest.json',65536)
         match_release(release,manifest,archived)
         return dict(version=version,sha256=manifest['sha256'],already_mirrored=True)
-    # Draft lookup by tag may be absent; enumerate only this repository's drafts.
-    if release is None:
-        candidates = gh('api','repos/'+REPOSITORY+'/releases?per_page=100')
-        found = [r for r in candidates if r.get('tag_name')==tag]
-        if len(found)>1:
-            raise ValueError('Ambiguous release')
-        release = found[0] if found else None
     work = Path(directory).absolute()
     work.mkdir(parents=True,exist_ok=True)
     name = alias(version)
@@ -275,7 +277,10 @@ def mirror(directory):
     if release is None:
         gh('release','create',tag,'--repo',REPOSITORY,'--draft','--target','main',
            '--title','ShortFlow '+version,'--notes-file',str(notes))
-        release = gh('api',endpoint)
+        release = release_by_tag(tag)
+    if release is None or type(release.get('id')) is not int:
+        raise ValueError('Created draft identity could not be verified')
+    endpoint = 'repos/'+REPOSITORY+'/releases/'+str(release['id'])
     if release.get('draft') is not True or release.get('prerelease') is not False:
         raise ValueError('Unexpected interrupted release state')
     expected = {p.name:p for p in (installer,checksum,metadata)}
