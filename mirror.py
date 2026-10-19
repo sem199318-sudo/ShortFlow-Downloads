@@ -186,16 +186,25 @@ def match_release(release, manifest, raw, *, require_immutable=True, keys=KEYS):
         raise ValueError('Archived release identifies different bytes or compatibility')
     name = alias(manifest['version'])
     if (type(release) is not dict or release.get('tag_name')!='v'+manifest['version'] or
-            release.get('draft') is not False or release.get('prerelease') is not False):
+            release.get('prerelease') is not False):
         raise ValueError('Release is not a public stable mirror')
-    if require_immutable and release.get('immutable') is not True:
-        raise ValueError('Published release must be immutable')
+    if require_immutable:
+        if release.get('draft') is not False or release.get('immutable') is not True:
+            raise ValueError('Published release must be immutable')
+    elif release.get('draft') is not True:
+        raise ValueError('Pre-publication checks require the actual draft')
     assets = release.get('assets',[])
     if len(assets)!=3 or {a.get('name') for a in assets}!={name,name+'.sha256','signed-manifest.json'}:
         raise ValueError('Ambiguous public release assets')
     for item in assets:
-        if item.get('state')!='uploaded' or item.get('browser_download_url')!=asset_url(manifest['version'], item['name']):
+        if item.get('state')!='uploaded':
+            raise ValueError('Public asset upload incomplete')
+        if require_immutable and item.get('browser_download_url')!=asset_url(manifest['version'], item['name']):
             raise ValueError('Unexpected public asset location')
+        if not require_immutable:
+            if (type(item.get('id')) is not int or item['id']<=0 or item.get('url')!=
+                    'https://api.github.com/repos/'+REPOSITORY+'/releases/assets/'+str(item['id'])):
+                raise ValueError('Draft asset belongs to an unexpected repository')
     installer = next(a for a in assets if a['name']==name)
     if installer.get('size')!=manifest['size'] or installer.get('digest')!='sha256:'+manifest['sha256']:
         raise ValueError('Public installer identity mismatch')
@@ -297,7 +306,6 @@ def mirror(directory):
         if name not in names:
             gh('release','upload',tag,str(path),'--repo',REPOSITORY)
     candidate = gh('api',endpoint)
-    candidate = dict(candidate,draft=False)
     match_release(candidate,manifest,raw,require_immutable=False)
     # The authority must still name these exact bytes after network transfer.
     if read_bytes(FEED,65536)!=raw:
