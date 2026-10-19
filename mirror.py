@@ -175,6 +175,11 @@ def asset_contents(manifest, raw):
         'signed-manifest.json':raw}
 
 
+def write_verification_assets(directory,manifest,raw):
+    for name,body in asset_contents(manifest,raw).items():
+        (Path(directory)/name).write_bytes(body)
+
+
 def match_release(release, manifest, raw, *, require_immutable=True, keys=KEYS):
     # The fresh feed is the current authority. Immutable metadata is historical
     # evidence for the same bytes, and may outlive its original freshness window.
@@ -275,10 +280,9 @@ def mirror(directory):
         finally:
             if temporary.exists(): temporary.unlink()
     verify_file(installer,manifest)
+    write_verification_assets(work,manifest,raw)
     checksum = work/(name+'.sha256')
-    checksum.write_text(manifest['sha256']+'  '+name+'\n',encoding='ascii')
     metadata = work/'signed-manifest.json'
-    metadata.write_bytes(raw)
     notes = work/'notes.txt'
     notes.write_text('ShortFlow '+version+' for Windows x64.\n\n'+manifest['notes']+
         '\n\nInstaller bytes are verified against the existing Ed25519-signed stable feed.\n'+
